@@ -20,7 +20,6 @@ __pycache__/
 # Experiment logs and outputs
 logs/
 *.log
-results*.json
 results_*/
 results-k-sweep/
 results_k_sweep/
