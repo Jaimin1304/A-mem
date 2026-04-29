@@ -21,6 +21,7 @@ __pycache__/
 logs/
 *.log
 results_*/
+results*.json
 results-k-sweep/
 results_k_sweep/
 

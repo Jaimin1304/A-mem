@@ -68,13 +68,15 @@ class RobustAdvancedMemAgent:
     """Agent using the robust memory system with plain-text LLM calls."""
 
     def __init__(self, model, backend, retrieve_k, temperature_c5,
-                 sglang_host="http://localhost", sglang_port=30000):
+                 sglang_host="http://localhost", sglang_port=30000,
+                 llm_temperature: Optional[float] = None):
         self.memory_system = RobustAgenticMemorySystem(
             model_name='all-MiniLM-L6-v2',
             llm_backend=backend,
             llm_model=model,
             sglang_host=sglang_host,
             sglang_port=sglang_port,
+            llm_temperature=llm_temperature,
         )
         self.retriever_llm = RobustLLMController(
             backend=backend,
@@ -82,6 +84,7 @@ class RobustAdvancedMemAgent:
             api_key=None,
             sglang_host=sglang_host,
             sglang_port=sglang_port,
+            temperature_override=llm_temperature,
         )
         self.retrieve_k = retrieve_k
         self.temperature_c5 = temperature_c5
@@ -210,10 +213,41 @@ def _build_category5_choices(samples):
     return choices
 
 
-def _build_per_category_scores(category_counts, aggregate_results):
+def _parse_categories(category_values: Optional[List[str]]) -> List[int]:
+    if not category_values:
+        return list(LOCOMO_CATEGORY_NAMES.keys())
+
+    categories = []
+    for value in category_values:
+        for item in value.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                category = int(item)
+            except ValueError as e:
+                raise ValueError(f"Invalid LoCoMo category: {item}") from e
+            if category not in LOCOMO_CATEGORY_NAMES:
+                raise ValueError("LoCoMo categories must be integers from 1 to 5")
+            if category not in categories:
+                categories.append(category)
+    if not categories:
+        raise ValueError("At least one LoCoMo category must be selected")
+    return sorted(categories)
+
+
+def _temperature_cache_suffix(llm_temperature: Optional[float]) -> str:
+    if llm_temperature is None:
+        return ""
+    temperature_text = str(llm_temperature).replace(".", "p").replace("-", "m")
+    return f"_temp{temperature_text}"
+
+
+def _build_per_category_scores(category_counts, aggregate_results, allow_categories):
     """Build compact category score summary for the result JSON."""
     per_category_scores = {}
-    for category, name in LOCOMO_CATEGORY_NAMES.items():
+    for category in allow_categories:
+        name = LOCOMO_CATEGORY_NAMES[category]
         category_metrics = aggregate_results.get(f"category_{category}", {})
         per_category_scores[name] = {
             "category": category,
@@ -226,10 +260,11 @@ def _build_per_category_scores(category_counts, aggregate_results):
 
 def _evaluate_sample(sample_idx, sample, model, backend, retrieve_k, temperature_c5,
                      sglang_host, sglang_port, memories_dir, allow_categories,
-                     eval_logger, category5_choices=None, total_samples=None):
+                     eval_logger, category5_choices=None, total_samples=None,
+                     llm_temperature: Optional[float] = None):
     """Evaluate one LoCoMo sample. Samples are independent memory systems."""
     agent = RobustAdvancedMemAgent(model, backend, retrieve_k, temperature_c5,
-                                   sglang_host, sglang_port)
+                                   sglang_host, sglang_port, llm_temperature)
 
     memory_cache_file = os.path.join(memories_dir, f"memory_cache_sample_{sample_idx}.pkl")
     retriever_cache_file = os.path.join(memories_dir, f"retriever_cache_sample_{sample_idx}.pkl")
@@ -280,16 +315,17 @@ def _evaluate_sample(sample_idx, sample, model, backend, retrieve_k, temperature
     sample_total_questions = 0
 
     for qa_idx, qa in enumerate(sample.qa):
-        if int(qa.category) in allow_categories:
+        category = int(qa.category)
+        if category in allow_categories:
             sample_total_questions += 1
-            sample_category_counts[qa.category] += 1
+            sample_category_counts[category] += 1
 
             answer_options = None
             if category5_choices is not None:
                 answer_options = category5_choices.get((sample_idx, qa_idx))
 
             prediction, user_prompt, raw_context = agent.answer_question(
-                qa.question, qa.category, qa.final_answer, answer_options=answer_options
+                qa.question, category, qa.final_answer, answer_options=answer_options
             )
 
             prediction = parse_plain_text_answer(prediction)
@@ -308,13 +344,13 @@ def _evaluate_sample(sample_idx, sample, model, backend, retrieve_k, temperature
             }
 
             sample_metrics.append(metrics)
-            sample_categories.append(qa.category)
+            sample_categories.append(category)
             sample_results.append({
                 "sample_id": sample_idx,
                 "question": qa.question,
                 "prediction": prediction,
                 "reference": qa.final_answer,
-                "category": qa.category,
+                "category": category,
                 "metrics": metrics,
             })
 
@@ -335,7 +371,9 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                      ratio: float = 1.0, backend: str = "sglang",
                      temperature_c5: float = 0.5, retrieve_k: int = 10,
                      sglang_host: str = "http://localhost", sglang_port: int = 30000,
-                     sample_workers: int = 1):
+                     sample_workers: int = 1,
+                     llm_temperature: Optional[float] = None,
+                     categories: Optional[List[int]] = None):
     """Evaluate the robust agent on the LoComo dataset."""
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
     log_filename = f"eval_robust_{model}_{backend}_ratio{ratio}_{timestamp}.log"
@@ -345,6 +383,10 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     eval_logger = setup_logger(log_path)
     eval_logger.info(f"Loading dataset from {dataset_path}")
     eval_logger.info(f"Using ROBUST memory layer (no JSON schema dependency)")
+    if llm_temperature is None:
+        eval_logger.info("Using default per-call LLM temperatures")
+    else:
+        eval_logger.info(f"Using LLM temperature override: {llm_temperature}")
 
     samples = load_locomo_dataset(dataset_path)
     eval_logger.info(f"Loaded {len(samples)} samples")
@@ -363,10 +405,13 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     error_num = 0
     memories_dir = os.path.join(
         os.path.dirname(__file__),
-        "cached_memories_robust_{}_{}".format(backend, model),
+        "cached_memories_robust_{}_{}{}".format(
+            backend, model, _temperature_cache_suffix(llm_temperature)
+        ),
     )
     os.makedirs(memories_dir, exist_ok=True)
-    allow_categories = [1, 2, 3, 4, 5]
+    allow_categories = categories or list(LOCOMO_CATEGORY_NAMES.keys())
+    eval_logger.info(f"Evaluating LoCoMo categories: {allow_categories}")
 
     sample_workers = max(1, min(sample_workers, len(samples)))
     sample_outputs = []
@@ -376,17 +421,18 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                 sample_idx, sample, model, backend, retrieve_k, temperature_c5,
                 sglang_host, sglang_port, memories_dir, allow_categories,
                 eval_logger, category5_choices=None, total_samples=len(samples),
+                llm_temperature=llm_temperature,
             ))
     else:
         eval_logger.info(f"Evaluating samples concurrently with {sample_workers} workers")
-        category5_choices = _build_category5_choices(samples)
+        category5_choices = _build_category5_choices(samples) if 5 in allow_categories else None
         executor = ThreadPoolExecutor(max_workers=sample_workers)
         futures = [
             executor.submit(
                 _evaluate_sample,
                 sample_idx, sample, model, backend, retrieve_k, temperature_c5,
                 sglang_host, sglang_port, memories_dir, allow_categories,
-                eval_logger, category5_choices, len(samples),
+                eval_logger, category5_choices, len(samples), llm_temperature,
             )
             for sample_idx, sample in enumerate(samples)
         ]
@@ -421,11 +467,16 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         "model": model,
         "dataset": dataset_path,
         "memory_layer": "robust",
+        "llm_temperature": llm_temperature,
+        "categories": allow_categories,
         "total_questions": total_questions,
         "category_distribution": {
-            str(cat): count for cat, count in category_counts.items()
+            str(category): category_counts.get(category, 0)
+            for category in allow_categories
         },
-        "per_category_scores": _build_per_category_scores(category_counts, aggregate_results),
+        "per_category_scores": _build_per_category_scores(
+            category_counts, aggregate_results, allow_categories
+        ),
         "aggregate_metrics": aggregate_results,
         "individual_results": results,
     }
@@ -440,7 +491,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     eval_logger.info(f"Total questions evaluated: {total_questions}")
     eval_logger.info("Category Distribution:")
     for category, count in sorted(category_counts.items()):
-        eval_logger.info(f"Category {category}: {count} questions ({count/total_questions*100:.1f}%)")
+        percentage = count / total_questions * 100 if total_questions else 0.0
+        eval_logger.info(f"Category {category}: {count} questions ({percentage:.1f}%)")
 
     eval_logger.info("Aggregate Metrics:")
     for split_name, metrics in aggregate_results.items():
@@ -469,8 +521,12 @@ def main():
                         help="Backend to use (openai, groq, ollama, sglang, or vllm)")
     parser.add_argument("--temperature_c5", type=float, default=0.5,
                         help="Temperature for category 5 questions")
+    parser.add_argument("--llm_temperature", type=float, default=None,
+                        help="Optional temperature override for all LLM calls")
     parser.add_argument("--retrieve_k", type=int, default=10,
                         help="Number of memories to retrieve")
+    parser.add_argument("--categories", nargs="+", default=None,
+                        help="LoCoMo categories to evaluate, e.g. --categories 1 2 3 4 or --categories 1,2,3,4")
     parser.add_argument("--sample_workers", type=int, default=1,
                         help="Number of LoCoMo samples to evaluate concurrently")
     parser.add_argument("--sglang_host", type=str, default="http://localhost",
@@ -483,14 +539,18 @@ def main():
         raise ValueError("Ratio must be between 0.0 and 1.0")
     if args.sample_workers < 1:
         raise ValueError("sample_workers must be >= 1")
+    if args.llm_temperature is not None and args.llm_temperature < 0.0:
+        raise ValueError("llm_temperature must be >= 0.0")
 
     dataset_path = os.path.join(os.path.dirname(__file__), args.dataset)
     output_path = os.path.join(os.path.dirname(__file__), args.output) if args.output else None
+    categories = _parse_categories(args.categories)
 
     evaluate_dataset(
         dataset_path, args.model, output_path, args.ratio,
         args.backend, args.temperature_c5, args.retrieve_k,
         args.sglang_host, args.sglang_port, args.sample_workers,
+        args.llm_temperature, categories,
     )
 
 

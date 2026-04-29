@@ -2,21 +2,23 @@
 
 A novel agentic memory system for LLM agents that can dynamically organize memories in an agentic way.
 
-> **Note:** This repository is specifically designed to reproduce the results presented in our paper. If you want to use the A-Mem system in building your agents, please refer to our official implementation at: [A-mem-sys](https://github.com/WujiangXu/A-mem-sys)
+> **Note:** This repository is specifically designed to reproduce the results presented in the original A-Mem paper. If you want to use the A-Mem system in building your agents, please refer to the authors' official implementation at: [A-mem-sys](https://github.com/WujiangXu/A-mem-sys)
 
-For more details, please refer to our paper: [A-Mem: Agentic Memory for LLM Agents](https://arxiv.org/pdf/2502.12110)
+> **Fork notice:** This repository is a hard fork of [WujiangXu/A-mem](https://github.com/WujiangXu/A-mem). It does not change the core A-Mem logic; the changes in this fork focus on improving the experimental pipeline, adding support for additional experiment models, and enriching experiment outputs.
+
+For more details, please refer to the original paper: [A-Mem: Agentic Memory for LLM Agents](https://arxiv.org/pdf/2502.12110)
 
 ## Introduction 🌟
 
 Large Language Model (LLM) agents have demonstrated remarkable capabilities in handling complex real-world tasks through external tool usage. However, to effectively leverage historical experiences, they require sophisticated memory systems. Traditional memory systems, while providing basic storage and retrieval functionality, often lack advanced memory organization capabilities.
 
-Our project introduces an innovative **Agentic Memory** system that revolutionizes how LLM agents manage and utilize their memories:
+The original A-Mem project introduces an innovative **Agentic Memory** system that changes how LLM agents manage and utilize their memories:
 
 <div align="center">
   <img src="Figure/intro-a.jpg" alt="Traditional Memory System" width="600"/>
-  <img src="Figure/intro-b.jpg" alt="Our Proposed Agentic Memory" width="600"/>
+  <img src="Figure/intro-b.jpg" alt="Proposed Agentic Memory" width="600"/>
   <br>
-  <em>Comparison between traditional memory system (top) and our proposed agentic memory (bottom). Our system enables dynamic memory operations and flexible agent-memory interactions.</em>
+  <em>Comparison between a traditional memory system (top) and the proposed agentic memory system (bottom). The A-Mem system enables dynamic memory operations and flexible agent-memory interactions.</em>
 </div>
 
 ## Key Features ✨
@@ -33,7 +35,7 @@ Our project introduces an innovative **Agentic Memory** system that revolutioniz
 <div align="center">
   <img src="Figure/framework.jpg" alt="Agentic Memory Framework" width="800"/>
   <br>
-  <em>The framework of our Agentic Memory system showing the dynamic interaction between LLM agents and memory components.</em>
+  <em>The A-Mem framework showing the dynamic interaction between LLM agents and memory components.</em>
 </div>
 
 ## How It Works 🛠️
@@ -121,6 +123,8 @@ Key arguments:
 - `--retrieve_k`: Number of memories to retrieve per query (default: 10). Tune this per model for best results.
 - `--ratio`: Fraction of dataset to evaluate (e.g., `--ratio 0.1` for 10% quick test).
 - `--backend`: One of `openai`, `groq`, `vllm`, `ollama`.
+- `--llm_temperature`: Optional temperature override for all LLM calls. If omitted, the existing per-call defaults are used.
+- `--categories`: Optional LoCoMo category subset to evaluate, e.g. `--categories 1 2 3 4` or `--categories 1,2,3,4`. If omitted, all five categories are evaluated.
 - `--sample_workers`: Number of LoCoMo samples to evaluate concurrently (default: 1).
 - `--sglang_port`: Port for vLLM/SGLang server (default: 30000).
 
@@ -129,7 +133,7 @@ Key arguments:
 bash run_k_sweep.sh
 ```
 
-**Note:** To achieve the optimal performance reported in our paper, please adjust the hyperparameter `k` value accordingly. Memories are cached after the first run, so subsequent k-sweep evaluations only re-run the QA answering step.
+**Note:** To achieve the optimal performance reported in the original paper, please adjust the hyperparameter `k` value accordingly. Memories are cached after the first run, so subsequent k-sweep evaluations only re-run the QA answering step.
 
 **Categories Information:** The LoCoMo dataset contains the following categories:
 * Category 1: Multi-hop
@@ -142,7 +146,7 @@ For more details about the categories, please refer to [this GitHub issue](https
 
 ## Citation 📚
 
-If you use this code in your research, please cite our work:
+If you use this code in your research, please cite the original A-Mem work:
 
 ```bibtex
 @inproceedings{xu2025amem,

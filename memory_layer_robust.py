@@ -101,6 +101,10 @@ class RobustBaseLLMController(ABC):
 
     SYSTEM_MESSAGE = "Follow the format specified in the prompt exactly. Do not add extra commentary."
 
+    def _effective_temperature(self, temperature: float) -> float:
+        override = getattr(self, "temperature_override", None)
+        return override if override is not None else temperature
+
     @abstractmethod
     def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
         """Get a plain-text completion from the LLM."""
@@ -143,6 +147,7 @@ class RobustOpenAIController(RobustBaseLLMController):
 
     @retry_llm_call(max_retries=2)
     def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+        temperature = self._effective_temperature(temperature)
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -209,6 +214,7 @@ class RobustGroqController(RobustBaseLLMController):
             self._raise_if_global_abort()
 
     def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+        temperature = self._effective_temperature(temperature)
         retry_count = 0
 
         while True:
@@ -260,6 +266,7 @@ class RobustOllamaController(RobustBaseLLMController):
 
     @retry_llm_call(max_retries=2)
     def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+        temperature = self._effective_temperature(temperature)
         try:
             from ollama import chat
         except ImportError:
@@ -292,6 +299,7 @@ class RobustSGLangController(RobustBaseLLMController):
 
     @retry_llm_call(max_retries=2)
     def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+        temperature = self._effective_temperature(temperature)
         payload = {
             "text": prompt,
             "sampling_params": {
@@ -329,6 +337,7 @@ class RobustVLLMController(RobustBaseLLMController):
 
     @retry_llm_call(max_retries=2)
     def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+        temperature = self._effective_temperature(temperature)
         payload = {
             "model": self.model,
             "messages": [
@@ -366,6 +375,7 @@ class RobustLiteLLMController(RobustBaseLLMController):
 
     @retry_llm_call(max_retries=2)
     def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+        temperature = self._effective_temperature(temperature)
         completion_args = {
             "model": self.model,
             "messages": [
@@ -400,6 +410,7 @@ class RobustLLMController:
         sglang_host: str = "http://localhost",
         sglang_port: int = 30000,
         check_connection: bool = False,
+        temperature_override: Optional[float] = None,
     ):
         if backend == "openai":
             self.llm = RobustOpenAIController(model, api_key)
@@ -415,6 +426,8 @@ class RobustLLMController:
             raise ValueError(
                 "Backend must be 'openai', 'groq', 'ollama', 'sglang', or 'vllm'"
             )
+
+        self.llm.temperature_override = temperature_override
 
         if check_connection:
             self.llm.check_connectivity()
@@ -531,6 +544,7 @@ class RobustAgenticMemorySystem:
         sglang_host: str = "http://localhost",
         sglang_port: int = 30000,
         check_connection: bool = False,
+        llm_temperature: Optional[float] = None,
     ):
 
         self.memories: Dict[str, RobustMemoryNote] = {}
@@ -543,6 +557,7 @@ class RobustAgenticMemorySystem:
             sglang_host,
             sglang_port,
             check_connection,
+            llm_temperature,
         )
         self.evo_cnt = 0
         self.evo_threshold = evo_threshold
