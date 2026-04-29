@@ -88,12 +88,21 @@ python test_advanced.py
 
 **Option B — Robust evaluation (recommended, works with any LLM backend):**
 
-The robust evaluation (`test_advanced_robust.py`) removes the JSON schema dependency and supports OpenAI API, vLLM, and Ollama backends.
+The robust evaluation (`test_advanced_robust.py`) removes the JSON schema dependency and supports OpenAI API, Groq API, vLLM, and Ollama backends.
 
 ```bash
 # OpenAI models
 python test_advanced_robust.py --backend openai --model gpt-4o-mini \
     --dataset data/locomo10.json --output results_robust_gpt-4o-mini.json
+
+# Groq models (put GROQ_API_KEY in .env or export it)
+python test_advanced_robust.py --backend groq --model openai/gpt-oss-20b \
+    --dataset data/locomo10.json --output results_robust_groq_gpt-oss-20b.json
+
+# Groq full LoCoMo run with one independent worker per sample
+python test_advanced_robust.py --backend groq --model openai/gpt-oss-20b \
+    --dataset data/locomo10.json --output results_robust_groq_gpt-oss-20b.json \
+    --sample_workers 10
 
 # vLLM-served open-source models (start vLLM server first)
 python -m vllm.entrypoints.openai.api_server \
@@ -111,7 +120,8 @@ python test_advanced_robust.py --backend ollama --model qwen2.5:3b \
 Key arguments:
 - `--retrieve_k`: Number of memories to retrieve per query (default: 10). Tune this per model for best results.
 - `--ratio`: Fraction of dataset to evaluate (e.g., `--ratio 0.1` for 10% quick test).
-- `--backend`: One of `openai`, `vllm`, `ollama`.
+- `--backend`: One of `openai`, `groq`, `vllm`, `ollama`.
+- `--sample_workers`: Number of LoCoMo samples to evaluate concurrently (default: 1).
 - `--sglang_port`: Port for vLLM/SGLang server (default: 30000).
 
 4. Run the full k-sweep to find optimal retrieval k per model:
@@ -146,5 +156,3 @@ If you use this code in your research, please cite our work:
 ## License 📄
 
 This project is licensed under the MIT License. See LICENSE for details.
-
-

@@ -18,6 +18,7 @@ import os
 import time
 import logging
 import functools
+import threading
 from datetime import datetime
 from abc import ABC, abstractmethod
 
@@ -36,13 +37,27 @@ from llm_text_parsers import (
 )
 
 logger = logging.getLogger("amem_robust")
+_GROQ_GLOBAL_ABORT = threading.Event()
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except Exception:
+    pass
 
 # ---------------------------------------------------------------------------
 # Retry decorator
 # ---------------------------------------------------------------------------
 
+
+class GroqUsageLimitError(RuntimeError):
+    """Raised when Groq retry limits are exceeded or a worker-wide abort is active."""
+
+
 def retry_llm_call(max_retries: int = 2, base_delay: float = 1.0):
     """Decorator: retry an LLM call with exponential backoff."""
+
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -53,22 +68,33 @@ def retry_llm_call(max_retries: int = 2, base_delay: float = 1.0):
                 except Exception as e:
                     last_exc = e
                     if attempt < max_retries:
-                        delay = base_delay * (2 ** attempt)
+                        delay = base_delay * (2**attempt)
                         logger.warning(
                             "LLM call %s failed (attempt %d/%d): %s — retrying in %.1fs",
-                            func.__name__, attempt + 1, max_retries + 1, e, delay,
+                            func.__name__,
+                            attempt + 1,
+                            max_retries + 1,
+                            e,
+                            delay,
                         )
                         time.sleep(delay)
-            logger.error("LLM call %s failed after %d attempts: %s",
-                         func.__name__, max_retries + 1, last_exc)
+            logger.error(
+                "LLM call %s failed after %d attempts: %s",
+                func.__name__,
+                max_retries + 1,
+                last_exc,
+            )
             raise last_exc
+
         return wrapper
+
     return decorator
 
 
 # ---------------------------------------------------------------------------
 # Robust LLM Controllers — no response_format parameter
 # ---------------------------------------------------------------------------
+
 
 class RobustBaseLLMController(ABC):
     """Base class for robust LLM controllers (no JSON schema dependency)."""
@@ -83,10 +109,14 @@ class RobustBaseLLMController(ABC):
     def check_connectivity(self):
         """Send a test call to verify the backend is reachable."""
         try:
-            response = self.get_completion("Reply with exactly one word: READY", temperature=0.0)
+            response = self.get_completion(
+                "Reply with exactly one word: READY", temperature=0.0
+            )
             if not response or not response.strip():
                 raise ConnectionError("Empty response from LLM backend")
-            logger.info("LLM connectivity check passed (response: %s)", response.strip()[:50])
+            logger.info(
+                "LLM connectivity check passed (response: %s)", response.strip()[:50]
+            )
         except Exception as e:
             raise ConnectionError(
                 f"Cannot reach LLM backend: {e}. "
@@ -99,12 +129,16 @@ class RobustOpenAIController(RobustBaseLLMController):
         try:
             from openai import OpenAI
         except ImportError:
-            raise ImportError("OpenAI package not found. Install it with: pip install openai")
+            raise ImportError(
+                "OpenAI package not found. Install it with: pip install openai"
+            )
         self.model = model
         if api_key is None:
-            api_key = os.getenv('OPENAI_API_KEY')
+            api_key = os.getenv("OPENAI_API_KEY")
         if api_key is None:
-            raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable.")
+            raise ValueError(
+                "OpenAI API key not found. Set OPENAI_API_KEY environment variable."
+            )
         self.client = OpenAI(api_key=api_key)
 
     @retry_llm_call(max_retries=2)
@@ -113,12 +147,109 @@ class RobustOpenAIController(RobustBaseLLMController):
             model=self.model,
             messages=[
                 {"role": "system", "content": self.SYSTEM_MESSAGE},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
             temperature=temperature,
             max_tokens=1000,
         )
         return response.choices[0].message.content
+
+
+class RobustGroqController(RobustBaseLLMController):
+    """Controller for Groq's OpenAI-compatible Responses API."""
+
+    MAX_RETRIES = 36
+    RETRY_DELAY_SECONDS = 6
+
+    def __init__(
+        self, model: str = "openai/gpt-oss-20b", api_key: Optional[str] = None
+    ):
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise ImportError(
+                "OpenAI package not found. Install it with: pip install openai"
+            )
+        self.model = model
+        if api_key is None:
+            api_key = os.getenv("GROQ_API_KEY")
+        if api_key is None:
+            raise ValueError(
+                "Groq API key not found. Set GROQ_API_KEY in .env or environment."
+            )
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1",
+        )
+
+    def _is_usage_limit_error(self, error: Exception) -> bool:
+        status_code = getattr(error, "status_code", None)
+        if status_code == 429:
+            return True
+        message = str(error).lower()
+        limit_markers = (
+            "usage limit",
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "requests per minute",
+            "tokens per minute",
+            "429",
+        )
+        return any(marker in message for marker in limit_markers)
+
+    def _raise_if_global_abort(self):
+        if _GROQ_GLOBAL_ABORT.is_set():
+            raise GroqUsageLimitError(
+                "Groq retry limit exceeded in another worker; terminating program."
+            )
+
+    def _wait_before_retry(self):
+        if _GROQ_GLOBAL_ABORT.wait(self.RETRY_DELAY_SECONDS):
+            self._raise_if_global_abort()
+
+    def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+        retry_count = 0
+
+        while True:
+            self._raise_if_global_abort()
+            try:
+                response = self.client.responses.create(
+                    model=self.model,
+                    input=f"{self.SYSTEM_MESSAGE}\n\n{prompt}",
+                    temperature=temperature,
+                    max_output_tokens=1000,
+                )
+                return response.output_text
+            except Exception as e:
+                retry_count += 1
+                is_usage_limit = self._is_usage_limit_error(e)
+                if retry_count > self.MAX_RETRIES:
+                    _GROQ_GLOBAL_ABORT.set()
+                    if is_usage_limit:
+                        logger.critical(
+                            "Groq usage/rate limit exceeded %d retries in one worker; terminating program.",
+                            self.MAX_RETRIES,
+                        )
+                        raise GroqUsageLimitError(str(e)) from e
+                    logger.critical(
+                        "Groq LLM call exceeded %d retries in one worker; terminating program.",
+                        self.MAX_RETRIES,
+                    )
+                    raise GroqUsageLimitError(str(e)) from e
+
+                retry_reason = (
+                    "usage/rate limit" if is_usage_limit else "LLM call failure"
+                )
+                logger.warning(
+                    "Groq %s hit (retry %d/%d): %s — sleeping %ds before retrying.",
+                    retry_reason,
+                    retry_count,
+                    self.MAX_RETRIES,
+                    e,
+                    self.RETRY_DELAY_SECONDS,
+                )
+                self._wait_before_retry()
 
 
 class RobustOllamaController(RobustBaseLLMController):
@@ -132,12 +263,14 @@ class RobustOllamaController(RobustBaseLLMController):
         try:
             from ollama import chat
         except ImportError:
-            raise ImportError("ollama package not found. Install it with: pip install ollama")
+            raise ImportError(
+                "ollama package not found. Install it with: pip install ollama"
+            )
         response = chat(
             model=self.model,
             messages=[
                 {"role": "system", "content": self.SYSTEM_MESSAGE},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
             options={"temperature": temperature},
         )
@@ -145,10 +278,14 @@ class RobustOllamaController(RobustBaseLLMController):
 
 
 class RobustSGLangController(RobustBaseLLMController):
-    def __init__(self, model: str = "llama2",
-                 sglang_host: str = "http://localhost",
-                 sglang_port: int = 30000):
+    def __init__(
+        self,
+        model: str = "llama2",
+        sglang_host: str = "http://localhost",
+        sglang_port: int = 30000,
+    ):
         import requests as _requests
+
         self._requests = _requests
         self.model = model
         self.base_url = f"{sglang_host}:{sglang_port}"
@@ -160,7 +297,7 @@ class RobustSGLangController(RobustBaseLLMController):
             "sampling_params": {
                 "temperature": temperature,
                 "max_new_tokens": 1000,
-            }
+            },
         }
         response = self._requests.post(
             f"{self.base_url}/generate",
@@ -170,16 +307,22 @@ class RobustSGLangController(RobustBaseLLMController):
         )
         if response.status_code == 200:
             return response.json().get("text", "")
-        raise RuntimeError(f"SGLang server returned status {response.status_code}: {response.text}")
+        raise RuntimeError(
+            f"SGLang server returned status {response.status_code}: {response.text}"
+        )
 
 
 class RobustVLLMController(RobustBaseLLMController):
     """Controller for vLLM's OpenAI-compatible API server."""
 
-    def __init__(self, model: str = "llama2",
-                 vllm_host: str = "http://localhost",
-                 vllm_port: int = 30000):
+    def __init__(
+        self,
+        model: str = "llama2",
+        vllm_host: str = "http://localhost",
+        vllm_port: int = 30000,
+    ):
         import requests as _requests
+
         self._requests = _requests
         self.model = model
         self.base_url = f"{vllm_host}:{vllm_port}"
@@ -203,15 +346,19 @@ class RobustVLLMController(RobustBaseLLMController):
         )
         if response.status_code == 200:
             return response.json()["choices"][0]["message"]["content"]
-        raise RuntimeError(f"vLLM server returned status {response.status_code}: {response.text}")
+        raise RuntimeError(
+            f"vLLM server returned status {response.status_code}: {response.text}"
+        )
 
 
 class RobustLiteLLMController(RobustBaseLLMController):
     """LiteLLM controller for universal LLM access (Ollama, SGLang, etc.)."""
 
-    def __init__(self, model: str, api_base: Optional[str] = None,
-                 api_key: Optional[str] = None):
+    def __init__(
+        self, model: str, api_base: Optional[str] = None, api_key: Optional[str] = None
+    ):
         from litellm import completion as _completion
+
         self._completion = _completion
         self.model = model
         self.api_base = api_base
@@ -223,7 +370,7 @@ class RobustLiteLLMController(RobustBaseLLMController):
             "model": self.model,
             "messages": [
                 {"role": "system", "content": self.SYSTEM_MESSAGE},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
             "temperature": temperature,
         }
@@ -240,19 +387,24 @@ class RobustLiteLLMController(RobustBaseLLMController):
 # Factory
 # ---------------------------------------------------------------------------
 
+
 class RobustLLMController:
     """Factory that selects the right robust LLM controller."""
 
-    def __init__(self,
-                 backend: Literal["openai", "ollama", "sglang", "vllm"] = "sglang",
-                 model: str = "gpt-4",
-                 api_key: Optional[str] = None,
-                 api_base: Optional[str] = None,
-                 sglang_host: str = "http://localhost",
-                 sglang_port: int = 30000,
-                 check_connection: bool = False):
+    def __init__(
+        self,
+        backend: Literal["openai", "groq", "ollama", "sglang", "vllm"] = "sglang",
+        model: str = "gpt-4",
+        api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
+        sglang_host: str = "http://localhost",
+        sglang_port: int = 30000,
+        check_connection: bool = False,
+    ):
         if backend == "openai":
             self.llm = RobustOpenAIController(model, api_key)
+        elif backend == "groq":
+            self.llm = RobustGroqController(model, api_key)
         elif backend == "ollama":
             self.llm = RobustOllamaController(model)
         elif backend == "sglang":
@@ -260,7 +412,9 @@ class RobustLLMController:
         elif backend == "vllm":
             self.llm = RobustVLLMController(model, sglang_host, sglang_port)
         else:
-            raise ValueError("Backend must be 'openai', 'ollama', 'sglang', or 'vllm'")
+            raise ValueError(
+                "Backend must be 'openai', 'groq', 'ollama', 'sglang', or 'vllm'"
+            )
 
         if check_connection:
             self.llm.check_connectivity()
@@ -270,27 +424,32 @@ class RobustLLMController:
 # RobustMemoryNote
 # ---------------------------------------------------------------------------
 
+
 class RobustMemoryNote:
     """Memory note that uses plain-text LLM calls for metadata extraction."""
 
-    def __init__(self,
-                 content: str,
-                 id: Optional[str] = None,
-                 keywords: Optional[List[str]] = None,
-                 links: Optional[Dict] = None,
-                 importance_score: Optional[float] = None,
-                 retrieval_count: Optional[int] = None,
-                 timestamp: Optional[str] = None,
-                 last_accessed: Optional[str] = None,
-                 context: Optional[str] = None,
-                 evolution_history: Optional[List] = None,
-                 category: Optional[str] = None,
-                 tags: Optional[List[str]] = None,
-                 llm_controller: Optional[RobustLLMController] = None):
+    def __init__(
+        self,
+        content: str,
+        id: Optional[str] = None,
+        keywords: Optional[List[str]] = None,
+        links: Optional[Dict] = None,
+        importance_score: Optional[float] = None,
+        retrieval_count: Optional[int] = None,
+        timestamp: Optional[str] = None,
+        last_accessed: Optional[str] = None,
+        context: Optional[str] = None,
+        evolution_history: Optional[List] = None,
+        category: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        llm_controller: Optional[RobustLLMController] = None,
+    ):
 
         self.content = content
 
-        if llm_controller and any(p is None for p in [keywords, context, category, tags]):
+        if llm_controller and any(
+            p is None for p in [keywords, context, category, tags]
+        ):
             analysis = self.analyze_content(content, llm_controller)
             logger.debug("analysis result: %s", analysis)
             keywords = keywords or analysis["keywords"]
@@ -324,10 +483,15 @@ class RobustMemoryNote:
 
             # If keywords still empty after parsing, try focused retry
             if not analysis["keywords"]:
-                logger.info("Keywords empty after initial parse — retrying with focused prompt")
+                logger.info(
+                    "Keywords empty after initial parse — retrying with focused prompt"
+                )
                 retry_prompt = FOCUSED_KEYWORDS_PROMPT.format(content=content)
-                retry_response = llm_controller.llm.get_completion(retry_prompt, temperature=0.3)
+                retry_response = llm_controller.llm.get_completion(
+                    retry_prompt, temperature=0.3
+                )
                 from llm_text_parsers import _parse_list_items
+
                 analysis["keywords"] = _parse_list_items(retry_response)
 
             # Final validation
@@ -335,9 +499,12 @@ class RobustMemoryNote:
             return analysis
 
         except Exception as e:
+            if isinstance(e, GroqUsageLimitError):
+                raise
             logger.error("Error analyzing content: %s", e)
             # Graceful degradation: heuristic keywords/context
             from llm_text_parsers import _heuristic_keywords, _heuristic_context
+
             return {
                 "keywords": _heuristic_keywords(content),
                 "context": _heuristic_context(content),
@@ -349,25 +516,33 @@ class RobustMemoryNote:
 # RobustAgenticMemorySystem
 # ---------------------------------------------------------------------------
 
+
 class RobustAgenticMemorySystem:
     """Memory management system using plain-text LLM calls (no JSON schema)."""
 
-    def __init__(self,
-                 model_name: str = 'all-MiniLM-L6-v2',
-                 llm_backend: str = "sglang",
-                 llm_model: str = "gpt-4o-mini",
-                 evo_threshold: int = 100,
-                 api_key: Optional[str] = None,
-                 api_base: Optional[str] = None,
-                 sglang_host: str = "http://localhost",
-                 sglang_port: int = 30000,
-                 check_connection: bool = False):
+    def __init__(
+        self,
+        model_name: str = "all-MiniLM-L6-v2",
+        llm_backend: str = "sglang",
+        llm_model: str = "gpt-4o-mini",
+        evo_threshold: int = 100,
+        api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
+        sglang_host: str = "http://localhost",
+        sglang_port: int = 30000,
+        check_connection: bool = False,
+    ):
 
         self.memories: Dict[str, RobustMemoryNote] = {}
         self.retriever = SimpleEmbeddingRetriever(model_name)
         self.llm_controller = RobustLLMController(
-            llm_backend, llm_model, api_key, api_base,
-            sglang_host, sglang_port, check_connection,
+            llm_backend,
+            llm_model,
+            api_key,
+            api_base,
+            sglang_host,
+            sglang_port,
+            check_connection,
         )
         self.evo_cnt = 0
         self.evo_threshold = evo_threshold
@@ -384,12 +559,18 @@ class RobustAgenticMemorySystem:
         )
         evo_label, note = self.process_memory(note)
         self.memories[note.id] = note
-        self.retriever.add_documents([
-            "content:" + note.content +
-            " context:" + note.context +
-            " keywords: " + ", ".join(note.keywords) +
-            " tags: " + ", ".join(note.tags)
-        ])
+        self.retriever.add_documents(
+            [
+                "content:"
+                + note.content
+                + " context:"
+                + note.context
+                + " keywords: "
+                + ", ".join(note.keywords)
+                + " tags: "
+                + ", ".join(note.tags)
+            ]
+        )
         if evo_label:
             self.evo_cnt += 1
             if self.evo_cnt % self.evo_threshold == 0:
@@ -399,13 +580,15 @@ class RobustAgenticMemorySystem:
     def consolidate_memories(self):
         """Re-initialize the retriever with current memory state."""
         try:
-            model_name = self.retriever.model.get_config_dict()['model_name']
+            model_name = self.retriever.model.get_config_dict()["model_name"]
         except (AttributeError, KeyError):
-            model_name = 'all-MiniLM-L6-v2'
+            model_name = "all-MiniLM-L6-v2"
 
         self.retriever = SimpleEmbeddingRetriever(model_name)
         for memory in self.memories.values():
-            metadata_text = f"{memory.context} {' '.join(memory.keywords)} {' '.join(memory.tags)}"
+            metadata_text = (
+                f"{memory.context} {' '.join(memory.keywords)} {' '.join(memory.tags)}"
+            )
             self.retriever.add_documents([memory.content + " , " + metadata_text])
 
     def find_related_memories(self, query: str, k: int = 5) -> tuple:
@@ -418,12 +601,19 @@ class RobustAgenticMemorySystem:
         memory_str = ""
         for i in indices:
             memory_str += (
-                "memory index:" + str(i) +
-                "\t talk start time:" + all_memories[i].timestamp +
-                "\t memory content: " + all_memories[i].content +
-                "\t memory context: " + all_memories[i].context +
-                "\t memory keywords: " + str(all_memories[i].keywords) +
-                "\t memory tags: " + str(all_memories[i].tags) + "\n"
+                "memory index:"
+                + str(i)
+                + "\t talk start time:"
+                + all_memories[i].timestamp
+                + "\t memory content: "
+                + all_memories[i].content
+                + "\t memory context: "
+                + all_memories[i].context
+                + "\t memory keywords: "
+                + str(all_memories[i].keywords)
+                + "\t memory tags: "
+                + str(all_memories[i].tags)
+                + "\n"
             )
         return memory_str, indices
 
@@ -438,20 +628,32 @@ class RobustAgenticMemorySystem:
         for i in indices:
             j = 0
             memory_str += (
-                "talk start time:" + all_memories[i].timestamp +
-                "memory content: " + all_memories[i].content +
-                "memory context: " + all_memories[i].context +
-                "memory keywords: " + str(all_memories[i].keywords) +
-                "memory tags: " + str(all_memories[i].tags) + "\n"
+                "talk start time:"
+                + all_memories[i].timestamp
+                + "memory content: "
+                + all_memories[i].content
+                + "memory context: "
+                + all_memories[i].context
+                + "memory keywords: "
+                + str(all_memories[i].keywords)
+                + "memory tags: "
+                + str(all_memories[i].tags)
+                + "\n"
             )
             neighborhood = all_memories[i].links
             for neighbor in neighborhood:
                 memory_str += (
-                    "talk start time:" + all_memories[neighbor].timestamp +
-                    "memory content: " + all_memories[neighbor].content +
-                    "memory context: " + all_memories[neighbor].context +
-                    "memory keywords: " + str(all_memories[neighbor].keywords) +
-                    "memory tags: " + str(all_memories[neighbor].tags) + "\n"
+                    "talk start time:"
+                    + all_memories[neighbor].timestamp
+                    + "memory content: "
+                    + all_memories[neighbor].content
+                    + "memory context: "
+                    + all_memories[neighbor].context
+                    + "memory keywords: "
+                    + str(all_memories[neighbor].keywords)
+                    + "memory tags: "
+                    + str(all_memories[neighbor].tags)
+                    + "\n"
                 )
                 if j >= k:
                     break
@@ -488,8 +690,14 @@ class RobustAgenticMemorySystem:
             if decision["decision"] == "NO_EVOLUTION":
                 return False, note
 
-            should_strengthen = decision["decision"] in ("STRENGTHEN", "STRENGTHEN_AND_UPDATE")
-            should_update = decision["decision"] in ("UPDATE_NEIGHBOR", "STRENGTHEN_AND_UPDATE")
+            should_strengthen = decision["decision"] in (
+                "STRENGTHEN",
+                "STRENGTHEN_AND_UPDATE",
+            )
+            should_update = decision["decision"] in (
+                "UPDATE_NEIGHBOR",
+                "STRENGTHEN_AND_UPDATE",
+            )
 
             # ---- Call 2: Strengthen details (conditional) ----
             if should_strengthen:
@@ -498,7 +706,9 @@ class RobustAgenticMemorySystem:
                     keywords=note.keywords,
                     nearest_neighbors_memories=neighbor_memory,
                 )
-                strengthen_response = self.llm_controller.llm.get_completion(strengthen_prompt)
+                strengthen_response = self.llm_controller.llm.get_completion(
+                    strengthen_prompt
+                )
                 strengthen = parse_strengthen_details(strengthen_response)
                 logger.debug("Strengthen details: %s", strengthen)
 
@@ -536,5 +746,11 @@ class RobustAgenticMemorySystem:
             return True, note
 
         except Exception as e:
-            logger.error("Evolution failed for note %s: %s — storing without evolution", note.id, e)
+            if isinstance(e, GroqUsageLimitError):
+                raise
+            logger.error(
+                "Evolution failed for note %s: %s — storing without evolution",
+                note.id,
+                e,
+            )
             return False, note

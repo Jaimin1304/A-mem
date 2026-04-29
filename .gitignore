@@ -1,0 +1,39 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Local tool state
+.codex
+.claude/settings.local.json
+
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Experiment logs and outputs
+logs/
+*.log
+results*.json
+results_*/
+results-k-sweep/
+results_k_sweep/
+
+# A-Mem generated memory/retriever caches
+cached_memories*/
+cached_memories_*/
+retriever_cache*.pkl
+memory_cache*.pkl
+retriever_cache_embeddings*.npy
+*.pkl
+*.npy
+
+# Local editor / OS noise
+.DS_Store
+Thumbs.db

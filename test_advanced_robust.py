@@ -4,10 +4,15 @@ Drop-in replacement for test_advanced.py.
 
 Usage:
     python test_advanced_robust.py --backend openai --model gpt-4o-mini --dataset data/locomo10.json
+    python test_advanced_robust.py --backend groq --model openai/gpt-oss-20b --dataset data/locomo10.json
     python test_advanced_robust.py --backend ollama --model qwen2.5:3b --dataset data/locomo10.json
 """
 
-from memory_layer_robust import RobustLLMController, RobustAgenticMemorySystem
+from memory_layer_robust import (
+    GroqUsageLimitError,
+    RobustLLMController,
+    RobustAgenticMemorySystem,
+)
 from llm_text_parsers import (
     parse_plain_text_answer,
     parse_relevant_parts,
@@ -28,6 +33,7 @@ import statistics
 from collections import defaultdict
 import pickle
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from utils import calculate_metrics, aggregate_metrics
 from datetime import datetime
@@ -48,6 +54,14 @@ except Exception as e:
     sentence_model = None
 
 logger = logging.getLogger("amem_robust")
+
+LOCOMO_CATEGORY_NAMES = {
+    1: "Single Hop",
+    2: "Temporal",
+    3: "Multi Hop",
+    4: "Open Domain",
+    5: "Adversarial",
+}
 
 
 class RobustAdvancedMemAgent:
@@ -106,7 +120,8 @@ Keywords:"""
         logger.debug("generate_query_llm response: %s", result)
         return result
 
-    def answer_question(self, question: str, category: int, answer: str) -> tuple:
+    def answer_question(self, question: str, category: int, answer: str,
+                        answer_options: Optional[List[str]] = None) -> tuple:
         """Generate answer for a question — plain text, no JSON schema."""
         keywords = self.generate_query_llm(question)
         raw_context = self.retrieve_memory(keywords, k=self.retrieve_k)
@@ -115,13 +130,16 @@ Keywords:"""
         assert category in [1, 2, 3, 4, 5]
 
         if category == 5:
-            answer_tmp = list()
-            if random.random() < 0.5:
-                answer_tmp.append('Not mentioned in the conversation')
-                answer_tmp.append(answer)
+            if answer_options is None:
+                answer_tmp = list()
+                if random.random() < 0.5:
+                    answer_tmp.append('Not mentioned in the conversation')
+                    answer_tmp.append(answer)
+                else:
+                    answer_tmp.append(answer)
+                    answer_tmp.append('Not mentioned in the conversation')
             else:
-                answer_tmp.append(answer)
-                answer_tmp.append('Not mentioned in the conversation')
+                answer_tmp = answer_options
             user_prompt = f"""Based on the context: {context}, answer the following question. {question}
 
 Select the correct answer: {answer_tmp[0]} or {answer_tmp[1]}  Short answer:"""
@@ -148,6 +166,8 @@ Question: {question} Short answer:"""
                 user_prompt, temperature=temperature,
             )
         except Exception as e:
+            if isinstance(e, GroqUsageLimitError):
+                raise
             logger.warning("answer_question failed: %s — returning empty", e)
             response = ""
         return response, user_prompt, raw_context
@@ -171,10 +191,151 @@ def setup_logger(log_file: Optional[str] = None) -> logging.Logger:
     return eval_logger
 
 
+def _build_category5_choices(samples):
+    """Precompute category-5 option order in serial sample/QA order."""
+    choices = {}
+    for sample_idx, sample in enumerate(samples):
+        for qa_idx, qa in enumerate(sample.qa):
+            if int(qa.category) == 5:
+                if random.random() < 0.5:
+                    choices[(sample_idx, qa_idx)] = [
+                        'Not mentioned in the conversation',
+                        qa.final_answer,
+                    ]
+                else:
+                    choices[(sample_idx, qa_idx)] = [
+                        qa.final_answer,
+                        'Not mentioned in the conversation',
+                    ]
+    return choices
+
+
+def _build_per_category_scores(category_counts, aggregate_results):
+    """Build compact category score summary for the result JSON."""
+    per_category_scores = {}
+    for category, name in LOCOMO_CATEGORY_NAMES.items():
+        category_metrics = aggregate_results.get(f"category_{category}", {})
+        per_category_scores[name] = {
+            "category": category,
+            "n": category_counts.get(category, category_counts.get(str(category), 0)),
+            "f1": category_metrics.get("f1", {}).get("mean", 0.0),
+            "bleu1": category_metrics.get("bleu1", {}).get("mean", 0.0),
+        }
+    return per_category_scores
+
+
+def _evaluate_sample(sample_idx, sample, model, backend, retrieve_k, temperature_c5,
+                     sglang_host, sglang_port, memories_dir, allow_categories,
+                     eval_logger, category5_choices=None, total_samples=None):
+    """Evaluate one LoCoMo sample. Samples are independent memory systems."""
+    agent = RobustAdvancedMemAgent(model, backend, retrieve_k, temperature_c5,
+                                   sglang_host, sglang_port)
+
+    memory_cache_file = os.path.join(memories_dir, f"memory_cache_sample_{sample_idx}.pkl")
+    retriever_cache_file = os.path.join(memories_dir, f"retriever_cache_sample_{sample_idx}.pkl")
+    retriever_cache_embeddings_file = os.path.join(
+        memories_dir, f"retriever_cache_embeddings_sample_{sample_idx}.npy"
+    )
+
+    if os.path.exists(memory_cache_file):
+        eval_logger.info(f"Loading cached memories for sample {sample_idx}")
+        with open(memory_cache_file, 'rb') as f:
+            cached_memories = pickle.load(f)
+        agent.memory_system.memories = cached_memories
+        if os.path.exists(retriever_cache_file):
+            eval_logger.info(f"Found retriever cache files for sample {sample_idx}")
+            agent.memory_system.retriever = agent.memory_system.retriever.load(
+                retriever_cache_file, retriever_cache_embeddings_file
+            )
+        else:
+            eval_logger.info(f"No retriever cache found for sample {sample_idx}, loading from memory")
+            agent.memory_system.retriever = agent.memory_system.retriever.load_from_local_memory(
+                cached_memories, 'all-MiniLM-L6-v2'
+            )
+        eval_logger.info(f"Successfully loaded {len(cached_memories)} memories for sample {sample_idx}")
+    else:
+        eval_logger.info(f"No cached memories found for sample {sample_idx}. Creating new memories.")
+
+        for _, turns in sample.conversation.sessions.items():
+            for turn in turns.turns:
+                turn_datatime = turns.date_time
+                conversation_tmp = "Speaker " + turn.speaker + "says : " + turn.text
+                agent.add_memory(conversation_tmp, time=turn_datatime)
+
+        memories_to_cache = agent.memory_system.memories
+        with open(memory_cache_file, 'wb') as f:
+            pickle.dump(memories_to_cache, f)
+        agent.memory_system.retriever.save(retriever_cache_file, retriever_cache_embeddings_file)
+        eval_logger.info(f"Successfully cached {len(memories_to_cache)} memories for sample {sample_idx}")
+
+    if total_samples is None:
+        eval_logger.info(f"Processing sample {sample_idx + 1}")
+    else:
+        eval_logger.info(f"Processing sample {sample_idx + 1}/{total_samples}")
+
+    sample_results = []
+    sample_metrics = []
+    sample_categories = []
+    sample_category_counts = defaultdict(int)
+    sample_total_questions = 0
+
+    for qa_idx, qa in enumerate(sample.qa):
+        if int(qa.category) in allow_categories:
+            sample_total_questions += 1
+            sample_category_counts[qa.category] += 1
+
+            answer_options = None
+            if category5_choices is not None:
+                answer_options = category5_choices.get((sample_idx, qa_idx))
+
+            prediction, user_prompt, raw_context = agent.answer_question(
+                qa.question, qa.category, qa.final_answer, answer_options=answer_options
+            )
+
+            prediction = parse_plain_text_answer(prediction)
+
+            eval_logger.info(f"Sample {sample_idx} question {sample_total_questions}: {qa.question}")
+            eval_logger.info(f"Prediction: {prediction}")
+            eval_logger.info(f"Reference: {qa.final_answer}")
+            eval_logger.info(f"User Prompt: {user_prompt}")
+            eval_logger.info(f"Category: {qa.category}")
+            eval_logger.info(f"Raw Context: {raw_context}")
+
+            metrics = calculate_metrics(prediction, qa.final_answer) if qa.final_answer else {
+                "exact_match": 0, "f1": 0.0, "rouge1_f": 0.0, "rouge2_f": 0.0,
+                "rougeL_f": 0.0, "bleu1": 0.0, "bleu2": 0.0, "bleu3": 0.0,
+                "bleu4": 0.0, "bert_f1": 0.0, "meteor": 0.0, "sbert_similarity": 0.0
+            }
+
+            sample_metrics.append(metrics)
+            sample_categories.append(qa.category)
+            sample_results.append({
+                "sample_id": sample_idx,
+                "question": qa.question,
+                "prediction": prediction,
+                "reference": qa.final_answer,
+                "category": qa.category,
+                "metrics": metrics,
+            })
+
+            if sample_total_questions % 10 == 0:
+                eval_logger.info(f"Sample {sample_idx}: processed {sample_total_questions} questions")
+
+    return {
+        "sample_idx": sample_idx,
+        "results": sample_results,
+        "metrics": sample_metrics,
+        "categories": sample_categories,
+        "category_counts": dict(sample_category_counts),
+        "total_questions": sample_total_questions,
+    }
+
+
 def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] = None,
                      ratio: float = 1.0, backend: str = "sglang",
                      temperature_c5: float = 0.5, retrieve_k: int = 10,
-                     sglang_host: str = "http://localhost", sglang_port: int = 30000):
+                     sglang_host: str = "http://localhost", sglang_port: int = 30000,
+                     sample_workers: int = 1):
     """Evaluate the robust agent on the LoComo dataset."""
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
     log_filename = f"eval_robust_{model}_{backend}_ratio{ratio}_{timestamp}.log"
@@ -199,7 +360,6 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     total_questions = 0
     category_counts = defaultdict(int)
 
-    i = 0
     error_num = 0
     memories_dir = os.path.join(
         os.path.dirname(__file__),
@@ -208,89 +368,52 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     os.makedirs(memories_dir, exist_ok=True)
     allow_categories = [1, 2, 3, 4, 5]
 
-    for sample_idx, sample in enumerate(samples):
-        agent = RobustAdvancedMemAgent(model, backend, retrieve_k, temperature_c5,
-                                       sglang_host, sglang_port)
+    sample_workers = max(1, min(sample_workers, len(samples)))
+    sample_outputs = []
+    if sample_workers == 1:
+        for sample_idx, sample in enumerate(samples):
+            sample_outputs.append(_evaluate_sample(
+                sample_idx, sample, model, backend, retrieve_k, temperature_c5,
+                sglang_host, sglang_port, memories_dir, allow_categories,
+                eval_logger, category5_choices=None, total_samples=len(samples),
+            ))
+    else:
+        eval_logger.info(f"Evaluating samples concurrently with {sample_workers} workers")
+        category5_choices = _build_category5_choices(samples)
+        executor = ThreadPoolExecutor(max_workers=sample_workers)
+        futures = [
+            executor.submit(
+                _evaluate_sample,
+                sample_idx, sample, model, backend, retrieve_k, temperature_c5,
+                sglang_host, sglang_port, memories_dir, allow_categories,
+                eval_logger, category5_choices, len(samples),
+            )
+            for sample_idx, sample in enumerate(samples)
+        ]
+        try:
+            for future in as_completed(futures):
+                try:
+                    sample_outputs.append(future.result())
+                except GroqUsageLimitError as e:
+                    eval_logger.critical(
+                        "A worker exceeded the Groq retry limit; cancelling remaining samples and terminating."
+                    )
+                    for pending_future in futures:
+                        pending_future.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise SystemExit(1) from e
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
-        memory_cache_file = os.path.join(memories_dir, f"memory_cache_sample_{sample_idx}.pkl")
-        retriever_cache_file = os.path.join(memories_dir, f"retriever_cache_sample_{sample_idx}.pkl")
-        retriever_cache_embeddings_file = os.path.join(
-            memories_dir, f"retriever_cache_embeddings_sample_{sample_idx}.npy"
-        )
+        sample_outputs.sort(key=lambda item: item["sample_idx"])
 
-        if os.path.exists(memory_cache_file):
-            eval_logger.info(f"Loading cached memories for sample {sample_idx}")
-            with open(memory_cache_file, 'rb') as f:
-                cached_memories = pickle.load(f)
-            agent.memory_system.memories = cached_memories
-            if os.path.exists(retriever_cache_file):
-                eval_logger.info(f"Found retriever cache files")
-                agent.memory_system.retriever = agent.memory_system.retriever.load(
-                    retriever_cache_file, retriever_cache_embeddings_file
-                )
-            else:
-                eval_logger.info(f"No retriever cache found, loading from memory")
-                agent.memory_system.retriever = agent.memory_system.retriever.load_from_local_memory(
-                    cached_memories, 'all-MiniLM-L6-v2'
-                )
-            eval_logger.info(f"Successfully loaded {len(cached_memories)} memories")
-        else:
-            eval_logger.info(f"No cached memories found for sample {sample_idx}. Creating new memories.")
-
-            for _, turns in sample.conversation.sessions.items():
-                for turn in turns.turns:
-                    turn_datatime = turns.date_time
-                    conversation_tmp = "Speaker " + turn.speaker + "says : " + turn.text
-                    agent.add_memory(conversation_tmp, time=turn_datatime)
-
-            memories_to_cache = agent.memory_system.memories
-            with open(memory_cache_file, 'wb') as f:
-                pickle.dump(memories_to_cache, f)
-            agent.memory_system.retriever.save(retriever_cache_file, retriever_cache_embeddings_file)
-            eval_logger.info(f"Successfully cached {len(memories_to_cache)} memories")
-
-        eval_logger.info(f"Processing sample {sample_idx + 1}/{len(samples)}")
-
-        for qa in sample.qa:
-            if int(qa.category) in allow_categories:
-                total_questions += 1
-                category_counts[qa.category] += 1
-
-                prediction, user_prompt, raw_context = agent.answer_question(
-                    qa.question, qa.category, qa.final_answer
-                )
-
-                # Parse the prediction (handles both JSON and plain text)
-                prediction = parse_plain_text_answer(prediction)
-
-                eval_logger.info(f"Question {total_questions}: {qa.question}")
-                eval_logger.info(f"Prediction: {prediction}")
-                eval_logger.info(f"Reference: {qa.final_answer}")
-                eval_logger.info(f"User Prompt: {user_prompt}")
-                eval_logger.info(f"Category: {qa.category}")
-                eval_logger.info(f"Raw Context: {raw_context}")
-
-                metrics = calculate_metrics(prediction, qa.final_answer) if qa.final_answer else {
-                    "exact_match": 0, "f1": 0.0, "rouge1_f": 0.0, "rouge2_f": 0.0,
-                    "rougeL_f": 0.0, "bleu1": 0.0, "bleu2": 0.0, "bleu3": 0.0,
-                    "bleu4": 0.0, "bert_f1": 0.0, "meteor": 0.0, "sbert_similarity": 0.0
-                }
-
-                all_metrics.append(metrics)
-                all_categories.append(qa.category)
-
-                result = {
-                    "sample_id": sample_idx,
-                    "question": qa.question,
-                    "prediction": prediction,
-                    "reference": qa.final_answer,
-                    "category": qa.category,
-                    "metrics": metrics,
-                }
-                results.append(result)
-
-                if total_questions % 10 == 0:
-                    eval_logger.info(f"Processed {total_questions} questions")
+    for sample_output in sample_outputs:
+        results.extend(sample_output["results"])
+        all_metrics.extend(sample_output["metrics"])
+        all_categories.extend(sample_output["categories"])
+        total_questions += sample_output["total_questions"]
+        for category, count in sample_output["category_counts"].items():
+            category_counts[category] += count
 
     aggregate_results = aggregate_metrics(all_metrics, all_categories)
 
@@ -302,6 +425,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         "category_distribution": {
             str(cat): count for cat, count in category_counts.items()
         },
+        "per_category_scores": _build_per_category_scores(category_counts, aggregate_results),
         "aggregate_metrics": aggregate_results,
         "individual_results": results,
     }
@@ -342,11 +466,13 @@ def main():
     parser.add_argument("--ratio", type=float, default=1.0,
                         help="Ratio of dataset to evaluate (0.0 to 1.0)")
     parser.add_argument("--backend", type=str, default="openai",
-                        help="Backend to use (openai, ollama, sglang, or vllm)")
+                        help="Backend to use (openai, groq, ollama, sglang, or vllm)")
     parser.add_argument("--temperature_c5", type=float, default=0.5,
                         help="Temperature for category 5 questions")
     parser.add_argument("--retrieve_k", type=int, default=10,
                         help="Number of memories to retrieve")
+    parser.add_argument("--sample_workers", type=int, default=1,
+                        help="Number of LoCoMo samples to evaluate concurrently")
     parser.add_argument("--sglang_host", type=str, default="http://localhost",
                         help="SGLang server host (for sglang backend)")
     parser.add_argument("--sglang_port", type=int, default=30000,
@@ -355,6 +481,8 @@ def main():
 
     if args.ratio <= 0.0 or args.ratio > 1.0:
         raise ValueError("Ratio must be between 0.0 and 1.0")
+    if args.sample_workers < 1:
+        raise ValueError("sample_workers must be >= 1")
 
     dataset_path = os.path.join(os.path.dirname(__file__), args.dataset)
     output_path = os.path.join(os.path.dirname(__file__), args.output) if args.output else None
@@ -362,7 +490,7 @@ def main():
     evaluate_dataset(
         dataset_path, args.model, output_path, args.ratio,
         args.backend, args.temperature_c5, args.retrieve_k,
-        args.sglang_host, args.sglang_port,
+        args.sglang_host, args.sglang_port, args.sample_workers,
     )
 
 
